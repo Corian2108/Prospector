@@ -3,3 +3,6 @@
 data/
 __pycache__/
 *.pyc
+# perfiles y datos locales
+chrome-data/
+service_account.json
