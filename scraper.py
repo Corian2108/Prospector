@@ -42,7 +42,7 @@ def load_config(env_path: str | Path = ".env"):
     sa_path = Path(service_account)
     if not sa_path.exists():
         sys.exit(f"ERROR: service account JSON no encontrado en '{service_account}'. "
-                 "Pon el archivo ahí o ajusta SERVICE_ACCOUNT_PATH en .env.")
+                 "Pon el archivo ahí o ajusta SERVICE_ACCOUNT_PATH")
         
     print("Configuración cargada. SPREADSHEET_KEY está presente y service account encontrado en:",
           str(sa_path.resolve()))
@@ -52,12 +52,12 @@ def load_config(env_path: str | Path = ".env"):
         "SERVICE_ACCOUNT_PATH": str(sa_path.resolve())
     }
 
-def iniciar_navegador(headless=False):
-    # Inicia Chrome con Selenium en WSL.
-    # Parámetros:
-    # headless (bool): True para ejecutar sin GUI, False para mostrar ventana.
-    # Retorna:
-    # driver (webdriver.Chrome): instancia del navegador
+def iniciar_navegador(headless=False, profile_dir=""):
+    """ Inicia Chrome con Selenium en WSL.
+    Parámetros:
+    headless (bool): True para ejecutar sin GUI, False para mostrar ventana.
+    Retorna:
+    driver (webdriver.Chrome): instancia del navegador """
     
     profile_dir = os.path.expanduser("~/prospector/chrome-data")
     os.makedirs(profile_dir, exist_ok=True) # crea la carpeta si no existe
@@ -142,14 +142,11 @@ def scrape_groups_to_sheet():
     # retornar resumen
     return {"found_total": len(found), "added": len(new_rows)}
 
-def scrape_posts():
+def scrape_posts(service_account_json, spreadsheet_key, groups_per_scrap=5):
     
-    # Itera hasta 5 grupos (los con LastChecked más antiguo, Active=true),
-    # procesa hasta 10 posts por grupo y guarda leads (si tienen teléfono) en
-    # la pestaña "Prospectos" del spreadsheet indicado en .env.
-    
-    # gc = service_account_json
-    # sh = gc.open_by_key(spreadsheet_key)
+    """ Itera hasta X grupos (los con LastChecked más antiguo, Active=true),
+    procesa hasta N posts por grupo y guarda leads (si tienen teléfono) en
+    la pestaña "Prospectos" del spreadsheet indicado en .env. """
 
     gc = gspread.service_account(filename=service_account_json)
     sh = gc.open_by_key(spreadsheet_key)
@@ -182,7 +179,7 @@ def scrape_posts():
     active_groups.sort(key=key_lc)
 
     # tomar hasta 5 grupos
-    groups_to_process = active_groups[:5]
+    groups_to_process = active_groups[:groups_per_scrap]
 
     # preparar dedupe en memoria y leer columna de teléfonos existentes (para evitar lecturas repetidas)
     seen_phones = set()
