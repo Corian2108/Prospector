@@ -17,6 +17,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
 from selenium.common.exceptions import (
     StaleElementReferenceException,
     ElementClickInterceptedException,
@@ -142,14 +143,11 @@ def scrape_groups_to_sheet():
     # retornar resumen
     return {"found_total": len(found), "added": len(new_rows)}
 
-def scrape_posts():
+def scrape_posts(limit_total, processed_count):
     
-    # Itera hasta 5 grupos (los con LastChecked más antiguo, Active=true),
-    # procesa hasta 10 posts por grupo y guarda leads (si tienen teléfono) en
-    # la pestaña "Prospectos" del spreadsheet indicado en .env.
-    
-    # gc = service_account_json
-    # sh = gc.open_by_key(spreadsheet_key)
+    """ Itera grupos (los con LastChecked más antiguo, Active=true),
+    procesa N posts por grupo y guarda leads (si tienen teléfono) en
+    la pestaña "Prospectos" del spreadsheet indicado en .env. """
 
     gc = gspread.service_account(filename=service_account_json)
     sh = gc.open_by_key(spreadsheet_key)
@@ -189,50 +187,25 @@ def scrape_posts():
     try:
         headers = ws_pros.row_values(1)
         tel_col_index = headers.index("Phone") + 1
+        sec_tel_col_index = headers.index("SecondaryPhone") + 1
     except ValueError:
         # si no existe, asumimos columna 3
         tel_col_index = 3
+        sec_tel_col_index = 4
 
     # leer columna de teléfonos ya guardados en sheet
     try:
         existing_tels = set(ws_pros.col_values(tel_col_index)[1:])  # quitar header
-    except Exception:
+        secondary_phones = set(ws_pros.col_values(sec_tel_col_index)[1:])
+        existing_tels.update(secondary_phones)
+    except Exception as e:
+        print("Error al tratar de conseguir teléfonos existentes. " ,e)
         existing_tels = set()
 
     # contadores y límites
-    processed_count = 0
-    limit_total = 50
     posts_per_group = 10
-    delay_between_groups_min = 25
-    delay_between_groups_max = 35
-
-    # helper: scroll para cargar posts dentro de un grupo
-    def scroll_and_load_group(driver, max_scrolls, pause):
-        body = driver.find_element(By.TAG_NAME, "body")
-        last_height = driver.execute_script("return document.body.scrollHeight")
-        for _ in range(max_scrolls):
-            body.send_keys(Keys.END)
-            time.sleep(pause)
-            new_height = driver.execute_script("return document.body.scrollHeight")
-            if new_height == last_height:
-                break
-            last_height = new_height
-
-    # helper: actualizar LastChecked para la fila del grupo
-    def update_lastchecked_in_sheet(url):
-        try:
-            cell = ws_groups.find(url)
-            if cell:
-                row = cell.row
-                # encontrar índice de columna LastChecked (header)
-                headers = ws_groups.row_values(1)
-                try:
-                    lc_idx = headers.index("LastChecked") + 1
-                except ValueError:
-                    lc_idx = 3  # asume posición por defecto
-                ws_groups.update_cell(row, lc_idx, datetime.now().date().isoformat())
-        except Exception as e:
-            print("Warning: no se pudo actualizar LastChecked para", url, ":", e)
+    delay_between_groups_min = 15
+    delay_between_groups_max = 25
 
     # main loop por grupos
     for group in groups_to_process:
@@ -248,10 +221,10 @@ def scrape_posts():
             WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[role='feed']")))
             time.sleep(2)
             feed = driver.find_element(By.CSS_SELECTOR, "div[role='feed']")
-            scroll_and_load_group(driver, max_scrolls=2, pause=2)
+            scroll_and_load_group(driver, max_scrolls=4, pause=2)
         except Exception as e:
             print("Error cargando grupo:", group_url, e)
-            update_lastchecked_in_sheet(group_url)
+            update_lastchecked_in_sheet(group_url, ws_groups)
             continue
 
         post_xpath = ".//div[.//div[@data-ad-rendering-role='story_message']]"
@@ -259,7 +232,7 @@ def scrape_posts():
         try:
             posts = feed.find_elements(By.XPATH, post_xpath)
             if len(posts)<posts_per_group:
-                scroll_and_load_group(driver, max_scrolls=2, pause=2)
+                scroll_and_load_group(driver, max_scrolls=4, pause=2)
                 feed = driver.find_element(By.CSS_SELECTOR, "div[role='feed']")
                 posts = feed.find_elements(By.XPATH, post_xpath)
         except Exception:
@@ -272,13 +245,11 @@ def scrape_posts():
                 break
 
             try:
-                # time.sleep(random.uniform(delay_between_posts_min, delay_between_posts_max))
-
                 result= extract_post_data(post)
 
                 if not result["phones"]:
                     total_processed += 1
-                    print("Skip teléfono inválido en post", result["profile_url"])
+                    print("Skip teléfono inválido en post", result["profile_url"], "Post procesados: ", total_processed)
                     continue
                 
                 primary=result['phones'][0]
@@ -286,13 +257,11 @@ def scrape_posts():
                 # validación mínima teléfono
                 if not primary or len(primary) < 8:
                     print("Skip: teléfono inválido:", primary, "en post", post_url)
-                    # posts_processed_in_group += 1
                     continue
 
                 # dedupe memoria + sheet
                 if primary in seen_phones or primary in existing_tels:
                     print("Skip duplicado:", primary)
-                    # posts_processed_in_group += 1
                     continue
 
                 # preparar fila para guardar en Prospectos
@@ -302,7 +271,7 @@ def scrape_posts():
                 header_map = {h: i+1 for i, h in enumerate(headers)}
 
                 # si falta alguna columna básica, crear una fila headers estándar (defensivo)
-                required_headers = ["Business","Name","Phone","SecondaryPhone","Status","Group","Timestamp","NextContact","City","URL","Email", "Channel", "PostText"]
+                required_headers = ["Business","Name","Phone","SecondaryPhone","Status","Group","Timestamp","NextContact","City","URL","Email", "Channel"]
                 if not all(h in header_map for h in required_headers):
                     ws_pros.clear()
                     ws_pros.append_row(required_headers, value_input_option="USER_ENTERED")
@@ -324,7 +293,6 @@ def scrape_posts():
                 row[header_map["URL"]-1] = post_url
                 row[header_map["Email"]-1] = ""             # intentar extraer con regex si quieres
                 row[header_map["Channel"]-1] = "FB"
-                row[header_map["PostText"]-1] = result["post_text"]
 
                 # append a sheet
                 ws_pros.append_row(row, value_input_option="USER_ENTERED")
@@ -332,6 +300,9 @@ def scrape_posts():
                 # marcar dedupe
                 seen_phones.add(primary)
                 existing_tels.add(primary)
+                if len(result["phones"])>1:
+                    seen_phones.add(result["phones"][1])
+                    existing_tels.add(result["phones"][1])
                 processed_count += 1
                 posts_processed_in_group += 1
                 total_processed += 1
@@ -346,18 +317,49 @@ def scrape_posts():
                 continue
 
         # actualización LastChecked del grupo procesado
-        update_lastchecked_in_sheet(group_url)
+        update_lastchecked_in_sheet(group_url, ws_groups)
         print(f"Grupo comletado {group['name']} con {total_processed} posts procesados")
         # delay entre grupos
         if processed_count < limit_total:
             sleep_t = random.uniform(delay_between_groups_min, delay_between_groups_max)
             print(f"Delay {sleep_t:.1f}s antes del siguiente grupo...")
             time.sleep(sleep_t)
-
+        
     # fin de run: resumen
     print("=== RUN COMPLETADO ===")
     print("Guardados totales:", processed_count)
     print("Terminado a:", datetime.now().isoformat())
+
+    if processed_count < limit_total:
+        scrape_posts(limit_total, processed_count)
+
+# helper: scroll para cargar posts dentro de un grupo
+def scroll_and_load_group(driver, max_scrolls, pause):
+    body = driver.find_element(By.TAG_NAME, "body")
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    for _ in range(max_scrolls):
+        body.send_keys(Keys.END)
+        time.sleep(pause)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+
+# helper: actualizar LastChecked para la fila del grupo
+def update_lastchecked_in_sheet(url, ws_groups):
+    try:
+        cell = ws_groups.find(url)
+        if cell:
+            row = cell.row
+            # encontrar índice de columna LastChecked (header)
+            headers = ws_groups.row_values(1)
+            try:
+                lc_idx = headers.index("LastChecked") + 1
+            except ValueError:
+                lc_idx = 3  # asume posición por defecto
+            ws_groups.update_cell(row, lc_idx, datetime.now().date().isoformat())
+    except Exception as e:
+        print("Warning: no se pudo actualizar LastChecked para", url, ":", e)
 
 def extract_post_data(post):
     """
@@ -385,13 +387,13 @@ def extract_post_data(post):
         # 1) texto del post (contenedor story_message)
         try:
             msg_el = post.find_element(By.XPATH, ".//div[@data-ad-rendering-role='story_message']")
-            post_text = msg_el.text or ""
+            # post_text = msg_el.text or ""
             post_html = msg_el.get_attribute("outerHTML") or ""
         except Exception:
             post_text = ""
             post_html = ""
 
-        result["post_text"] = post_text
+        # result["post_text"] = post_text
         result["post_html"] = post_html
 
         post_text = expand_post_and_get_text(post)
@@ -493,7 +495,8 @@ def expand_post_and_get_text(post, min_wait=1.5, max_wait=3.5, max_click_attempt
     # Primero obtener el texto actual del contenedor del mensaje (si existe)
     try:
         msg_el = post.find_element(By.XPATH, ".//div[@data-ad-rendering-role='story_message']")
-        pre_text = msg_el.text or ""
+        # pre_text = msg_el.text or ""
+        pre_text = clean_post_text(msg_el) or ""
         pre_html = msg_el.get_attribute("outerHTML") or ""
     except NoSuchElementException:
         # No hay contenido textual principal => devolvemos vacíos
@@ -503,7 +506,8 @@ def expand_post_and_get_text(post, min_wait=1.5, max_wait=3.5, max_click_attempt
         try:
             time.sleep(0.2)
             msg_el = post.find_element(By.XPATH, ".//div[@data-ad-rendering-role='story_message']")
-            pre_text = msg_el.text or ""
+            # pre_text = msg_el.text or ""
+            pre_text = clean_post_text(msg_el) or ""
             pre_html = msg_el.get_attribute("outerHTML") or ""
         except Exception:
             return ("")
@@ -585,7 +589,8 @@ def expand_post_and_get_text(post, min_wait=1.5, max_wait=3.5, max_click_attempt
         for _ in range(4):
             try:
                 msg_el = post.find_element(By.XPATH, ".//div[@data-ad-rendering-role='story_message']")
-                new_text = msg_el.text or ""
+                # new_text = msg_el.text or ""
+                new_text = clean_post_text(msg_el) or ""
                 new_html = msg_el.get_attribute("outerHTML") or ""
                 # si el texto cambió (por ejemplo se expandió), rompemos
                 if new_text and new_text != pre_text:
@@ -602,21 +607,35 @@ def expand_post_and_get_text(post, min_wait=1.5, max_wait=3.5, max_click_attempt
     # Si llegamos aquí devolvemos el texto/html actualizados y flag True
     return (new_text)
 
+def clean_post_text(msg_el):
+    # 1. Obtener HTML crudo del mensaje
+    raw_html = msg_el.get_attribute("innerHTML")
+
+    # 2. Parsear con BeautifulSoup
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    # 3. Eliminar bloques de comentarios
+    for comment_div in soup.find_all("div", attrs={"aria-label": lambda v: v and v.startswith("Comentario de")}):
+        comment_div.decompose()
+
+    # 4. Retornar texto limpio
+    return soup.get_text(separator=" ", strip=True)
+
 def extract_phones(post_text: str, post_html: str) -> list[str]:
-    # Busca números de teléfono en el texto o html de la publicación.
-    # Puede capturar formatos:
-    # - +593xxxxxxxxx
-    # - 09xxxxxxxx
-    # - wa.me/593xxxxxxxxx
-    # - whatsapp.com/send?phone=593xxxxxxxxx
-    # Retorna lista de números crudos (sin normalizar).
+    """ Busca números de teléfono en el texto o html de la publicación.
+    Puede capturar formatos:
+    - +593xxxxxxxxx
+    - 09xxxxxxxx
+    - wa.me/593xxxxxxxxx
+    - whatsapp.com/send?phone=593xxxxxxxxx
+    Retorna lista de números crudos (sin normalizar). """
     
     phones = set()
 
     # --- Buscar en texto ---
     if post_text:
         # +593xxxxxxxxx
-        matches = re.findall(r"\+593\d{9}", post_text)
+        matches = re.findall(r"\+593\d+", post_text)
         phones.update(matches)
 
         # 09xxxxxxxx
@@ -626,11 +645,11 @@ def extract_phones(post_text: str, post_html: str) -> list[str]:
     # --- Buscar en html (links wa.me o api whatsapp) ---
     if post_html:
         # wa.me/593xxxxxxxxx
-        matches = re.findall(r"wa\.me/(\d{9,12})", post_html)
+        matches = re.findall(r"wa\.me/(\d+)", post_html)
         phones.update(matches)
 
         # whatsapp.com/send?phone=593xxxxxxxxx
-        matches = re.findall(r"phone=(\d{9,12})", post_html)
+        matches = re.findall(r"phone=(\d+)", post_html)
         phones.update(matches)
 
     return list(phones)
@@ -656,9 +675,13 @@ def normalize_phone(raw_phone: str) -> str:
     if phone.startswith("0") and len(phone) in [8,9]:
         return "593" + phone[1:]
 
-    return phone
+    #formato 5930xxxxxxxxx
+    if phone.startswith("5930"):
+        return "593" + phone[4:]
 
-def send_message():
+    return phone
+#TODO: normalizar nombres, detectar cuáles son nombres de persona y nombres de empresa, cambiar de posicón en hoja
+def send_message(msg_type: str, pro_status: str):
     #Recuperar los mensajes activos
     gc = gspread.service_account(filename=service_account_json)
     sh = gc.open_by_key(spreadsheet_key)
@@ -671,7 +694,7 @@ def send_message():
     messages = ws_messages.get_all_records()
     active_messages = []
     for msg in messages:
-        if str(msg.get("Active", "")).strip().upper() in("TRUE", "SI", "YES", "1"):
+        if str(msg.get("Active", "")).strip().upper() in ("TRUE", "SI", "YES", "1") and str(msg.get("Type", "")).strip().upper() == msg_type.upper() :
             active_messages.append({"id": msg.get("ID", ""), "message": msg.get("Message", ""), "sended": msg.get("Sended", "")})
     
     #Normalizar valores vacíos de sended
@@ -687,14 +710,21 @@ def send_message():
     except gspread.WorksheetNotFound:
         raise RuntimeError("La hoja de prospectos no existe.")
 
+    today = datetime.today().strftime("%Y-%m-%d")
     prospects = ws_prospects.get_all_records()
     prospects_list = []
     for p in prospects:
-        if str(p.get("Status", "")).strip().upper() in("NUEVO"):
-            prospects_list.append({"name": p.get("Name", ""), "phone": p.get("Phone", ""), "date": p.get("Timestamp", ""), "walink": ""})
-            
+        #Recupera según estado: Nuevo/manda mensaje de apertura, Apertura/ manda seguimiento, Seguimiento/manda cierre
+        #Si los mensajes no son de apertura
+        if pro_status.upper() != "NUEVO":
+            if p.get("NextContact") == today and str(p.get("Status", "")).strip().upper() == pro_status.upper():
+                prospects_list.append({"name": p.get("Name", ""), "phone": p.get("Phone", ""), "date": p.get("Timestamp", ""), "walink": "", "status": p.get("Status", ""), "next_contact": p.get("NextContact", "")})
+        else:
+            if str(p.get("Status", "")).strip().upper() == pro_status.upper():
+                prospects_list.append({"name": p.get("Name", ""), "phone": p.get("Phone", ""), "date": p.get("Timestamp", ""), "walink": "", "status": p.get("Status", ""), "next_contact": p.get("NextContact", "")})
+    
     #Enviar mensaje
-    for p in prospects_list:
+    for p in prospects_list[:20]:
         #Generar link para abrir chat
         link = f"https://web.whatsapp.com/send/?phone={p["phone"]}&text&type=phone_number&app_absent=0&utm_campaign=wa_api_send"
         driver.get(link)
@@ -719,6 +749,21 @@ def send_message():
         WebDriverWait(driver, 5).until(EC.presence_of_all_elements_located((By.XPATH, '//*[@id="main"]/footer/div[1]/div/span/div/div[2]/div/div[3]/div[1]')))
         time.sleep(2)
         elem = driver.find_element(By.XPATH, '//*[@id="main"]/footer/div[1]/div/span/div/div[2]/div/div[3]/div[1]')
+
+        #si contiene div con role=row y estado = nuevo no enviar 
+        main = driver.find_elements(By.CSS_SELECTOR, "div[role='row']")
+        text = main[0].text
+        if len(main)>0 and "Los mensajes y las llamadas están cifrados" not in text and p["status"] == "Nuevo":
+            #marcar para revision manual con estado pendiente
+            cell = ws_prospects.find(str(p["phone"]))
+            row = cell.row
+            try:
+                stc_indx = headers.index("Status") + 1
+            except:
+                stc_indx = 5
+            ws_prospects.update_cell(row, stc_indx, "Pendiente")
+            print("Revisar manualmente el contacto: ", p["phone"], " Puede tener mensajes anteriores" )
+            continue
         
         #Enviar mensaje
         if paste_edit_and_send(elem, message):
@@ -734,17 +779,19 @@ def send_message():
                     except ValueError:
                         stc_indx = 5
                         ncc_indx = 8
-                    ws_prospects.update_cell(row, stc_indx, "Apertura")
-                    ws_prospects.update_cell(row, ncc_indx, (datetime.now() + timedelta(days=2)).date().isoformat())
+                    ws_prospects.update_cell(row, stc_indx, msg_type)
+                    if msg_type.upper() != "CIERRE":
+                        ws_prospects.update_cell(row, ncc_indx, (datetime.now() + timedelta(days=2)).date().isoformat())
+                #Aumentar mensaje enviado
+                chosen["sended"] += 1     
             except Exception as e:
                 print("Warning: no se pudo actualizar estado para: ", p["phone"], ":", e)
         else:
             print("No se pudo enviar mensaje a prospecto: ", p["phone"])
 
-        #Aumentar mensaje enviado
-        chosen["sended"] += 1
 
     #Actualizar información de los mensajes
+    #TODO: revisar porque no está registrando bien el envío
     for msg in active_messages:
         cell = ws_messages.find(str(msg["id"]))
         if cell:
@@ -939,11 +986,20 @@ def paste_edit_and_send(input_el, message,
 if __name__ == "__main__":
     driver = iniciar_navegador(headless=False)
     # driver.get("https://www.facebook.com")
+    # input("Presionar enter si estás loguedo")
     cfg = load_config()
     spreadsheet_key = cfg["SPREADSHEET_KEY"]
     service_account_json = cfg["SERVICE_ACCOUNT_PATH"]
     # scrape_groups_to_sheet()
-    # scrape_posts()
-    send_message()
-    input("Presiona Enter para cerrar el navegador...")
+    # scrape_posts(20, 0)
+    # input("Presiona Enter para pasar al envío de mensajes")
+    #Envía mensajes de apertura
+    # send_message("Apertura", "Nuevo")
+    # input("Presiona Enter para pasar a los seguimientos")
+    # envía de mensajes para seguimientos
+    send_message("Seguimiento", "Apertura")
+    input("Presiona Enter para pasar a los cierres")
+    # envía de mensajes para cierres
+    send_message("Cierre", "Seguimiento")
+    input("Presiona Enter para cerrar el navegador")
     driver.quit()
