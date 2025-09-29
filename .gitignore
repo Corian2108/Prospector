@@ -6,3 +6,5 @@ __pycache__/
 # perfiles y datos locales
 chrome-data/
 service_account.json
+pruebas.py
+posts_pruebas.py
